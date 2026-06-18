@@ -31,6 +31,6 @@ export const useTournamentStore = create<TournamentState>((set, get) => ({
     const tournament = get().tournaments.find((item) => item.id === tournamentId);
     if (!tournament || tournament.teams.includes(teamId)) return;
     const saved = await withFriendlyError(() => tournamentDb.save({ ...tournament, teams: [...tournament.teams, teamId] }));
-    set((state) => ({ tournaments: state.tournaments.map((item) => (item.id === tournamentId ? item : saved)) }));
+    set((state) => ({ tournaments: state.tournaments.map((item) => (item.id === tournamentId ? saved : item)) }));
   },
 }));
