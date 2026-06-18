@@ -17,23 +17,138 @@ test.describe('赛事报名功能验收测试', () => {
     await page.waitForSelector('.tournament-card', { timeout: 15000 });
   });
 
-  test('报名按钮与战队加载状态联动，加载完成后启用', async ({ page }) => {
+  test('模拟战队数据慢加载：加载中按钮禁用不提交，加载完成后报名→详情页立即新增 North Byte→大厅只更新当前赛事', async ({ context, page }) => {
+    await context.clearCookies();
+
+    await page.addInitScript(() => {
+      const delayed = new WeakSet();
+      const origGetAll = IDBObjectStore.prototype.getAll;
+      IDBObjectStore.prototype.getAll = function (this: IDBObjectStore, query?: unknown, count?: number): IDBRequest {
+        const req = origGetAll.call(this, query, count);
+        if (this.name === 'teams') {
+          delayed.add(req);
+        }
+        return req;
+      };
+
+      let done = false;
+      function patch() {
+        if (done) return;
+        let target: object | null = IDBRequest.prototype;
+        while (target && target !== Object.prototype) {
+          const desc = Object.getOwnPropertyDescriptor(target, 'onsuccess');
+          if (desc && desc.set) {
+            done = true;
+            const origSet = desc.set;
+            Object.defineProperty(IDBRequest.prototype, 'onsuccess', {
+              set(this: IDBRequest, fn: ((this: IDBRequest, ev: Event) => unknown) | null) {
+                if (delayed.has(this) && fn) {
+                  const origFn = fn;
+                  return origSet.call(this, function (this: IDBRequest, ev: Event) {
+                    setTimeout(() => origFn.call(this, ev), 1500);
+                  });
+                }
+                return origSet.call(this, fn);
+              },
+              configurable: true,
+            });
+            return;
+          }
+          target = Object.getPrototypeOf(target);
+        }
+      }
+      patch();
+      if (!done) {
+        const timer = setInterval(() => {
+          patch();
+          if (done) clearInterval(timer);
+        }, 10);
+      }
+    });
+
     await page.goto('/tournaments');
+    await page.waitForSelector('.tournament-card', { timeout: 15000 });
+    await page.evaluate(() => {
+      window.localStorage.clear();
+      window.indexedDB.deleteDatabase('ggarena-db');
+    });
+    await page.reload();
+    await page.waitForSelector('.tournament-card', { timeout: 20000 });
+
+    const tournamentStatesBefore: Array<{ name: string; teamCount: string }> = [];
+    const allCardsBefore = page.locator('.tournament-card');
+    const cardCountBefore = await allCardsBefore.count();
+    expect(cardCountBefore).toBeGreaterThan(0);
+    for (let i = 0; i < cardCountBefore; i++) {
+      const card = allCardsBefore.nth(i);
+      const name = await card.locator('h2').textContent();
+      const teamCount = await card.locator('.stat-line span').first().textContent();
+      tournamentStatesBefore.push({ name: name || '', teamCount: teamCount || '' });
+    }
+    const targetCardBefore = page.locator('.tournament-card', { hasText: 'Utility Draft' });
+    const targetTeamCountBefore = await targetCardBefore.locator('.stat-line span').first().textContent();
+
+    await targetCardBefore.getByRole('link', { name: '查看详情' }).click();
+    await page.waitForURL(/\/tournaments\/.+/);
+    await page.waitForSelector('.detail-hero h1', { timeout: 15000 });
+
+    const loadingButton = page.getByRole('button', { name: /数据加载中/ });
+    await expect(loadingButton).toBeVisible({ timeout: 3000 });
+    await expect(loadingButton).toBeDisabled();
+
+    const initialTeamCardsDuringLoading = page.locator('.card-grid .team-card');
+    const initialTeamCountDuringLoading = await initialTeamCardsDuringLoading.count();
+
+    await loadingButton.click({ force: true });
+    await delay(500);
+
+    const teamCountAfterForceClick = await page.locator('.card-grid .team-card').count();
+    expect(teamCountAfterForceClick).toBe(initialTeamCountDuringLoading);
+
+    const registerButton = page.getByRole('button', { name: /报名 North Byte/ });
+    await expect(registerButton).toBeVisible({ timeout: 5000 });
+    await expect(registerButton).toBeEnabled();
+
+    const initialTeamCards = page.locator('.card-grid .team-card');
+    const initialTeamCount = await initialTeamCards.count();
+
+    await registerButton.click();
+
+    await expect(page.getByRole('button', { name: /已报名/ })).toBeVisible({ timeout: 10000 });
+    await expect(page.getByRole('button', { name: /已报名/ })).toBeDisabled();
+
+    const updatedTeamCards = page.locator('.card-grid .team-card');
+    await expect(updatedTeamCards).toHaveCount(initialTeamCount + 1, { timeout: 5000 });
+
+    const northByteCard = page.locator('.card-grid .team-card', { hasText: 'North Byte' });
+    await expect(northByteCard).toBeVisible({ timeout: 5000 });
+
+    await page.getByRole('link', { name: '赛事' }).click();
+    await page.waitForURL('/tournaments');
     await page.waitForSelector('.tournament-card');
 
-    const registrationCard = page.locator('.tournament-card', { hasText: 'Red Spike Open' });
-    await expect(registrationCard).toBeVisible();
-    await registrationCard.getByRole('link', { name: '查看详情' }).click();
+    const targetCardAfter = page.locator('.tournament-card', { hasText: 'Utility Draft' });
+    const targetTeamCountAfter = await targetCardAfter.locator('.stat-line span').first().textContent();
 
-    await page.waitForURL(/\/tournaments\/.+/);
+    const numBefore = parseInt(targetTeamCountBefore!.split('/')[0], 10);
+    const numAfter = parseInt(targetTeamCountAfter!.split('/')[0], 10);
+    expect(numAfter).toBe(numBefore + 1);
 
-    const registerButton = page.getByRole('button', { name: /报名/ });
-    await expect(registerButton).toBeVisible();
+    const allCardsAfter = page.locator('.tournament-card');
+    const cardCountAfter = await allCardsAfter.count();
+    expect(cardCountAfter).toBe(cardCountBefore);
 
-    await expect(registerButton).toBeEnabled({ timeout: 10000 });
-    const buttonText = await registerButton.textContent();
-    expect(buttonText).toContain('报名');
-    expect(buttonText).not.toContain('加载中');
+    for (let i = 0; i < cardCountAfter; i++) {
+      const card = allCardsAfter.nth(i);
+      const name = await card.locator('h2').textContent();
+      const beforeState = tournamentStatesBefore.find((s) => s.name === name);
+      if (!beforeState) continue;
+
+      if (name !== 'Utility Draft') {
+        const teamCountAfter = await card.locator('.stat-line span').first().textContent();
+        expect(teamCountAfter).toBe(beforeState.teamCount);
+      }
+    }
   });
 
   test('无战队数据时按钮禁用且不提交空 teamId', async ({ page }) => {
@@ -49,8 +164,6 @@ test.describe('赛事报名功能验收测试', () => {
     const registerButton = page.getByRole('button', { name: /报名/ });
     await expect(registerButton).toBeVisible();
     await expect(registerButton).toBeEnabled({ timeout: 10000 });
-
-    const initialTeamCount = await page.locator('.card-grid .team-card').count();
 
     await page.evaluate(() => {
       return new Promise<void>((resolve, reject) => {
@@ -88,103 +201,6 @@ test.describe('赛事报名功能验收测试', () => {
     expect(teamCountAfterClick).toBe(teamCountAfterClear);
   });
 
-  test('报名成功后当前赛事详情页立即显示新队伍', async ({ page }) => {
-    await page.goto('/tournaments');
-    await page.waitForSelector('.tournament-card');
-
-    const targetTournament = page.locator('.tournament-card', { hasText: 'Utility Draft' });
-    await expect(targetTournament).toBeVisible();
-
-    await targetTournament.getByRole('link', { name: '查看详情' }).click();
-    await page.waitForURL(/\/tournaments\/.+/);
-
-    const registerButton = page.getByRole('button', { name: /报名/ });
-    await expect(registerButton).toBeVisible();
-    await expect(registerButton).toBeEnabled({ timeout: 10000 });
-
-    const buttonText = await registerButton.textContent();
-    if (buttonText?.includes('已报名')) {
-      return;
-    }
-
-    const initialTeamCards = page.locator('.card-grid .team-card');
-    const initialTeamCount = await initialTeamCards.count();
-
-    await registerButton.click();
-
-    await expect(registerButton).toContainText('已报名', { timeout: 10000 });
-
-    const updatedTeamCards = page.locator('.card-grid .team-card');
-    await expect(updatedTeamCards).toHaveCount(initialTeamCount + 1, { timeout: 5000 });
-
-    const newTeamCard = page.locator('.card-grid .team-card', { hasText: 'North Byte' });
-    await expect(newTeamCard).toBeVisible({ timeout: 5000 });
-  });
-
-  test('报名后返回赛事大厅，只有当前赛事队伍数更新，其他赛事不受影响', async ({ page }) => {
-    await page.goto('/tournaments');
-    await page.waitForSelector('.tournament-card');
-
-    const allCardsBefore = page.locator('.tournament-card');
-    const cardCountBefore = await allCardsBefore.count();
-    expect(cardCountBefore).toBeGreaterThan(0);
-
-    const tournamentStatesBefore: Array<{ name: string; teamCount: string }> = [];
-    for (let i = 0; i < cardCountBefore; i++) {
-      const card = allCardsBefore.nth(i);
-      const name = await card.locator('h2').textContent();
-      const teamCount = await card.locator('.stat-line span').first().textContent();
-      tournamentStatesBefore.push({ name: name || '', teamCount: teamCount || '' });
-    }
-
-    const targetCardBefore = page.locator('.tournament-card', { hasText: 'Utility Draft' });
-    const targetTeamCountBefore = await targetCardBefore.locator('.stat-line span').first().textContent();
-
-    await targetCardBefore.getByRole('link', { name: '查看详情' }).click();
-    await page.waitForURL(/\/tournaments\/.+/);
-
-    const registerButton = page.getByRole('button', { name: /报名/ });
-    await expect(registerButton).toBeVisible();
-    await expect(registerButton).toBeEnabled({ timeout: 10000 });
-
-    const buttonText = await registerButton.textContent();
-    const wasRegistered = buttonText?.includes('已报名');
-
-    if (!wasRegistered) {
-      await registerButton.click();
-      await expect(registerButton).toContainText('已报名', { timeout: 10000 });
-    }
-
-    await page.getByRole('link', { name: '赛事' }).click();
-    await page.waitForURL('/tournaments');
-    await page.waitForSelector('.tournament-card');
-
-    const targetCardAfter = page.locator('.tournament-card', { hasText: 'Utility Draft' });
-    const targetTeamCountAfter = await targetCardAfter.locator('.stat-line span').first().textContent();
-
-    if (!wasRegistered) {
-      const numBefore = parseInt(targetTeamCountBefore!.split('/')[0], 10);
-      const numAfter = parseInt(targetTeamCountAfter!.split('/')[0], 10);
-      expect(numAfter).toBe(numBefore + 1);
-    }
-
-    const allCardsAfter = page.locator('.tournament-card');
-    const cardCountAfter = await allCardsAfter.count();
-    expect(cardCountAfter).toBe(cardCountBefore);
-
-    for (let i = 0; i < cardCountAfter; i++) {
-      const card = allCardsAfter.nth(i);
-      const name = await card.locator('h2').textContent();
-      const beforeState = tournamentStatesBefore.find((s) => s.name === name);
-      if (!beforeState) continue;
-
-      if (name !== 'Utility Draft') {
-        const teamCountAfter = await card.locator('.stat-line span').first().textContent();
-        expect(teamCountAfter).toBe(beforeState.teamCount);
-      }
-    }
-  });
-
   test('已报名后按钮禁用并显示"已报名"，防止重复提交', async ({ page }) => {
     await page.goto('/tournaments');
     await page.waitForSelector('.tournament-card');
@@ -200,16 +216,17 @@ test.describe('赛事报名功能验收测试', () => {
     const buttonTextBefore = await registerButton.textContent();
     if (!buttonTextBefore?.includes('已报名')) {
       await registerButton.click();
-      await expect(registerButton).toContainText('已报名', { timeout: 10000 });
+      await expect(page.getByRole('button', { name: /已报名/ })).toBeVisible({ timeout: 10000 });
     }
 
-    await expect(registerButton).toBeDisabled();
-    await expect(registerButton).toContainText('已报名');
+    const registeredButton = page.getByRole('button', { name: /已报名/ });
+    await expect(registeredButton).toBeDisabled();
+    await expect(registeredButton).toContainText('已报名');
 
     const initialTeamCards = page.locator('.card-grid .team-card');
     const initialTeamCount = await initialTeamCards.count();
 
-    await registerButton.click({ force: true });
+    await registeredButton.click({ force: true });
     await delay(500);
 
     const afterTeamCards = page.locator('.card-grid .team-card');
