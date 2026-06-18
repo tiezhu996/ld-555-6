@@ -6,6 +6,7 @@ import { withFriendlyError } from '../utils/storage';
 interface TournamentState {
   tournaments: Tournament[];
   loading: boolean;
+  registering: boolean;
   loadTournaments: () => Promise<void>;
   createTournament: (tournament: Tournament) => Promise<void>;
   registerTeam: (tournamentId: string, teamId: string) => Promise<void>;
@@ -14,6 +15,7 @@ interface TournamentState {
 export const useTournamentStore = create<TournamentState>((set, get) => ({
   tournaments: [],
   loading: false,
+  registering: false,
   loadTournaments: async () => {
     set({ loading: true });
     try {
@@ -30,7 +32,15 @@ export const useTournamentStore = create<TournamentState>((set, get) => ({
   registerTeam: async (tournamentId, teamId) => {
     const tournament = get().tournaments.find((item) => item.id === tournamentId);
     if (!tournament || tournament.teams.includes(teamId)) return;
-    const saved = await withFriendlyError(() => tournamentDb.save({ ...tournament, teams: [...tournament.teams, teamId] }));
-    set((state) => ({ tournaments: state.tournaments.map((item) => (item.id === tournamentId ? saved : item)) }));
+    set({ registering: true });
+    try {
+      const saved = await withFriendlyError(() => tournamentDb.save({ ...tournament, teams: [...tournament.teams, teamId] }));
+      set((state) => ({
+        tournaments: state.tournaments.map((item) => (item.id === tournamentId ? saved : item)),
+        registering: false,
+      }));
+    } catch {
+      set({ registering: false });
+    }
   },
 }));
